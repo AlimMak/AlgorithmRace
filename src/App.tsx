@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { algorithmOptions, algorithms, type AlgoState, type AlgorithmKey } from './algorithms'
+import { algorithmOptions, algorithms, type AlgoState, type AlgorithmKey, type StepEvent } from './algorithms'
 import { Controls } from './components/Controls'
 import { Explanation } from './components/Explanation'
 import { Metrics } from './components/Metrics'
 import { RacePanel } from './components/RacePanel'
+import { Timeline } from './components/Timeline'
 import { dataPatternOptions, generateDataset, type DataPattern } from './utils/dataPatterns'
 import { normalizeSeed, randomSeed } from './utils/rng'
 
@@ -13,6 +14,8 @@ const DEFAULT_SPEED = 24
 const DEFAULT_LEFT: AlgorithmKey = 'quick'
 const DEFAULT_RIGHT: AlgorithmKey = 'merge'
 const MAX_TICKS_PER_FRAME = 24
+const HISTORY_CAP = 1800
+const SNAPSHOT_INTERVAL = 20
 
 interface RunnerState {
   algorithm: AlgorithmKey
@@ -25,6 +28,38 @@ interface RaceState {
   initialData: number[]
   left: RunnerState
   right: RunnerState
+}
+
+interface TimelineEntry {
+  leftStepped: boolean
+  rightStepped: boolean
+  leftEvents: StepEvent[]
+  rightEvents: StepEvent[]
+}
+
+interface TimelineCheckpoint {
+  step: number
+  race: RaceState
+}
+
+interface TimelineState {
+  baseStep: number
+  latestStep: number
+  cursorStep: number
+  baseRace: RaceState
+  entries: TimelineEntry[]
+  checkpoints: TimelineCheckpoint[]
+}
+
+interface SessionState {
+  race: RaceState
+  timeline: TimelineState
+}
+
+interface RunnerStepOutcome {
+  runner: RunnerState
+  didStep: boolean
+  events: StepEvent[]
 }
 
 const createRunner = (algorithm: AlgorithmKey, data: number[]): RunnerState => ({
@@ -46,53 +81,260 @@ const resetRace = (race: RaceState, left: AlgorithmKey, right: AlgorithmKey): Ra
   right: createRunner(right, race.initialData),
 })
 
+const cloneRace = (race: RaceState): RaceState => structuredClone(race)
+
+const createTimeline = (race: RaceState): TimelineState => ({
+  baseStep: 0,
+  latestStep: 0,
+  cursorStep: 0,
+  baseRace: cloneRace(race),
+  entries: [],
+  checkpoints: [{ step: 0, race: cloneRace(race) }],
+})
+
+const createSession = (race: RaceState): SessionState => ({
+  race,
+  timeline: createTimeline(race),
+})
+
 const isSorted = (data: number[]): boolean => data.every((value, index) => index === 0 || data[index - 1] <= value)
 
-const stepRunner = (runner: RunnerState): RunnerState => {
+const stepRunner = (runner: RunnerState): RunnerStepOutcome => {
   if (runner.state.done) {
-    return runner
+    return {
+      runner,
+      didStep: false,
+      events: [],
+    }
   }
 
   const next = algorithms[runner.algorithm].step(runner.state)
   const finishedAtTick = next.done && runner.finishedAtTick === null ? next.state.metrics.elapsedTicks : runner.finishedAtTick
 
   return {
-    ...runner,
-    state: next.state,
-    finishedAtTick,
+    runner: {
+      ...runner,
+      state: next.state,
+      finishedAtTick,
+    },
+    didStep: true,
+    events: next.events,
   }
 }
 
-const runSteps = (race: RaceState, leftSteps: number, rightSteps: number): RaceState => {
-  if (leftSteps <= 0 && rightSteps <= 0) {
-    return race
+const executeTick = (
+  race: RaceState,
+  leftRequested: boolean,
+  rightRequested: boolean,
+): { race: RaceState; entry: TimelineEntry | null } => {
+  const leftOutcome = leftRequested
+    ? stepRunner(race.left)
+    : {
+        runner: race.left,
+        didStep: false,
+        events: [],
+      }
+
+  const rightOutcome = rightRequested
+    ? stepRunner(race.right)
+    : {
+        runner: race.right,
+        didStep: false,
+        events: [],
+      }
+
+  if (!leftOutcome.didStep && !rightOutcome.didStep) {
+    return {
+      race,
+      entry: null,
+    }
   }
 
-  let left = race.left
-  let right = race.right
+  const nextRace: RaceState = {
+    ...race,
+    left: leftOutcome.runner,
+    right: rightOutcome.runner,
+  }
+
+  return {
+    race: nextRace,
+    entry: {
+      leftStepped: leftOutcome.didStep,
+      rightStepped: rightOutcome.didStep,
+      leftEvents: leftOutcome.events,
+      rightEvents: rightOutcome.events,
+    },
+  }
+}
+
+const runSteps = (
+  race: RaceState,
+  leftSteps: number,
+  rightSteps: number,
+): { race: RaceState; entries: TimelineEntry[] } => {
+  if (leftSteps <= 0 && rightSteps <= 0) {
+    return {
+      race,
+      entries: [],
+    }
+  }
+
+  let currentRace = race
+  const entries: TimelineEntry[] = []
   const loops = Math.max(leftSteps, rightSteps)
 
   for (let i = 0; i < loops; i += 1) {
-    if (i < leftSteps) {
-      left = stepRunner(left)
-    }
-    if (i < rightSteps) {
-      right = stepRunner(right)
+    const { race: nextRace, entry } = executeTick(currentRace, i < leftSteps, i < rightSteps)
+    currentRace = nextRace
+
+    if (entry) {
+      entries.push(entry)
     }
 
-    if (left.state.done && right.state.done) {
+    if (currentRace.left.state.done && currentRace.right.state.done) {
       break
     }
   }
 
-  if (left === race.left && right === race.right) {
-    return race
+  return {
+    race: currentRace,
+    entries,
+  }
+}
+
+const getTimelineEntry = (timeline: TimelineState, step: number): TimelineEntry | null => {
+  if (step <= timeline.baseStep || step > timeline.latestStep) {
+    return null
   }
 
+  return timeline.entries[step - timeline.baseStep - 1] ?? null
+}
+
+const replayEntry = (race: RaceState, entry: TimelineEntry): RaceState =>
+  executeTick(race, entry.leftStepped, entry.rightStepped).race
+
+const getRaceAtStep = (timeline: TimelineState, targetStep: number): RaceState => {
+  const clampedStep = Math.max(timeline.baseStep, Math.min(targetStep, timeline.latestStep))
+
+  if (clampedStep === timeline.baseStep) {
+    return cloneRace(timeline.baseRace)
+  }
+
+  let checkpoint: TimelineCheckpoint | null = null
+  for (let i = timeline.checkpoints.length - 1; i >= 0; i -= 1) {
+    const candidate = timeline.checkpoints[i]
+    if (candidate.step <= clampedStep && candidate.step >= timeline.baseStep) {
+      checkpoint = candidate
+      break
+    }
+  }
+
+  let currentStep = checkpoint ? checkpoint.step : timeline.baseStep
+  let race = checkpoint ? cloneRace(checkpoint.race) : cloneRace(timeline.baseRace)
+
+  while (currentStep < clampedStep) {
+    const entry = getTimelineEntry(timeline, currentStep + 1)
+    if (!entry) {
+      break
+    }
+    race = replayEntry(race, entry)
+    currentStep += 1
+  }
+
+  return race
+}
+
+const trimTimeline = (timeline: TimelineState): TimelineState => {
+  const nextBaseStep = Math.max(0, timeline.latestStep - HISTORY_CAP)
+
+  if (nextBaseStep <= timeline.baseStep) {
+    return timeline
+  }
+
+  const nextBaseRace = getRaceAtStep(timeline, nextBaseStep)
+  const dropCount = nextBaseStep - timeline.baseStep
+  const nextEntries = timeline.entries.slice(dropCount)
+  const nextCheckpoints = timeline.checkpoints.filter((checkpoint) => checkpoint.step >= nextBaseStep)
+
+  if (!nextCheckpoints.some((checkpoint) => checkpoint.step === nextBaseStep)) {
+    nextCheckpoints.unshift({
+      step: nextBaseStep,
+      race: cloneRace(nextBaseRace),
+    })
+  }
+
+  const clampedCursor = Math.min(timeline.latestStep, Math.max(nextBaseStep, timeline.cursorStep))
+
   return {
-    ...race,
-    left,
-    right,
+    ...timeline,
+    baseStep: nextBaseStep,
+    baseRace: nextBaseRace,
+    entries: nextEntries,
+    checkpoints: nextCheckpoints,
+    cursorStep: clampedCursor,
+  }
+}
+
+const truncateTimelineFuture = (timeline: TimelineState): TimelineState => {
+  if (timeline.cursorStep === timeline.latestStep) {
+    return timeline
+  }
+
+  const keepCount = Math.max(0, timeline.cursorStep - timeline.baseStep)
+
+  return {
+    ...timeline,
+    latestStep: timeline.cursorStep,
+    entries: timeline.entries.slice(0, keepCount),
+    checkpoints: timeline.checkpoints.filter((checkpoint) => checkpoint.step <= timeline.cursorStep),
+  }
+}
+
+const appendTimelineEntries = (timeline: TimelineState, startRace: RaceState, entries: TimelineEntry[]): TimelineState => {
+  if (entries.length === 0) {
+    return timeline
+  }
+
+  const nextEntries = [...timeline.entries]
+  const nextCheckpoints = [...timeline.checkpoints]
+  let latestStep = timeline.latestStep
+  let replayRace = startRace
+
+  for (const entry of entries) {
+    latestStep += 1
+    nextEntries.push(entry)
+    replayRace = replayEntry(replayRace, entry)
+
+    if (latestStep % SNAPSHOT_INTERVAL === 0) {
+      nextCheckpoints.push({
+        step: latestStep,
+        race: cloneRace(replayRace),
+      })
+    }
+  }
+
+  return trimTimeline({
+    ...timeline,
+    latestStep,
+    cursorStep: latestStep,
+    entries: nextEntries,
+    checkpoints: nextCheckpoints,
+  })
+}
+
+const advanceSession = (session: SessionState, leftSteps: number, rightSteps: number): SessionState => {
+  const batch = runSteps(session.race, leftSteps, rightSteps)
+
+  if (batch.entries.length === 0) {
+    return session
+  }
+
+  const timelineForAppend =
+    session.timeline.cursorStep < session.timeline.latestStep ? truncateTimelineFuture(session.timeline) : session.timeline
+
+  return {
+    race: batch.race,
+    timeline: appendTimelineEntries(timelineForAppend, session.race, batch.entries),
   }
 }
 
@@ -106,9 +348,9 @@ function App() {
   const [rightAlgorithm, setRightAlgorithm] = useState<AlgorithmKey>(DEFAULT_RIGHT)
   const [seedInput, setSeedInput] = useState(String(initialSeed))
   const [running, setRunning] = useState(false)
-  const [race, setRace] = useState<RaceState>(() => {
+  const [session, setSession] = useState<SessionState>(() => {
     const data = generateDataset({ size: DEFAULT_SIZE, pattern: DEFAULT_PATTERN, seed: initialSeed })
-    return createRace(data, initialSeed, DEFAULT_LEFT, DEFAULT_RIGHT)
+    return createSession(createRace(data, initialSeed, DEFAULT_LEFT, DEFAULT_RIGHT))
   })
 
   const frameRef = useRef<number | null>(null)
@@ -117,6 +359,8 @@ function App() {
   const leftAccumulatorRef = useRef(0)
   const rightAccumulatorRef = useRef(0)
 
+  const race = session.race
+  const timeline = session.timeline
   const allDone = race.left.state.done && race.right.state.done
   const isAnimating = running && !allDone
 
@@ -177,7 +421,7 @@ function App() {
         pattern,
         seed: seedValue,
       })
-      setRace(createRace(nextData, seedValue, leftAlgorithm, rightAlgorithm))
+      setSession(createSession(createRace(nextData, seedValue, leftAlgorithm, rightAlgorithm)))
     },
     [leftAlgorithm, pattern, rightAlgorithm, size],
   )
@@ -198,29 +442,109 @@ function App() {
 
   const handleReset = useCallback(() => {
     setRunning(false)
-    setRace((current) => resetRace(current, leftAlgorithm, rightAlgorithm))
+    setSession((current) => createSession(resetRace(current.race, leftAlgorithm, rightAlgorithm)))
   }, [leftAlgorithm, rightAlgorithm])
 
-  const handleStep = useCallback(() => {
-    setRace((current) => runSteps(current, 1, 1))
+  const handleAdvance = useCallback((leftSteps: number, rightSteps: number) => {
+    setSession((current) => advanceSession(current, leftSteps, rightSteps))
   }, [])
+
+  const handleStep = useCallback(() => {
+    handleAdvance(1, 1)
+  }, [handleAdvance])
 
   const handleLeftAlgorithm = useCallback((value: AlgorithmKey) => {
     setRunning(false)
     setLeftAlgorithm(value)
-    setRace((current) => ({
-      ...current,
-      left: createRunner(value, current.initialData),
-    }))
+    setSession((current) =>
+      createSession({
+        ...current.race,
+        left: createRunner(value, current.race.initialData),
+      }),
+    )
   }, [])
 
   const handleRightAlgorithm = useCallback((value: AlgorithmKey) => {
     setRunning(false)
     setRightAlgorithm(value)
-    setRace((current) => ({
-      ...current,
-      right: createRunner(value, current.initialData),
-    }))
+    setSession((current) =>
+      createSession({
+        ...current.race,
+        right: createRunner(value, current.race.initialData),
+      }),
+    )
+  }, [])
+
+  const handleScrub = useCallback((targetStep: number) => {
+    setRunning(false)
+    setSession((current) => {
+      const clampedStep = Math.max(current.timeline.baseStep, Math.min(targetStep, current.timeline.latestStep))
+
+      if (clampedStep === current.timeline.cursorStep) {
+        return current
+      }
+
+      return {
+        race: getRaceAtStep(current.timeline, clampedStep),
+        timeline: {
+          ...current.timeline,
+          cursorStep: clampedStep,
+        },
+      }
+    })
+  }, [])
+
+  const handleTimelineBack = useCallback(() => {
+    setRunning(false)
+    setSession((current) => {
+      const nextStep = Math.max(current.timeline.baseStep, current.timeline.cursorStep - 1)
+      if (nextStep === current.timeline.cursorStep) {
+        return current
+      }
+
+      return {
+        race: getRaceAtStep(current.timeline, nextStep),
+        timeline: {
+          ...current.timeline,
+          cursorStep: nextStep,
+        },
+      }
+    })
+  }, [])
+
+  const handleTimelineForward = useCallback(() => {
+    setRunning(false)
+    setSession((current) => {
+      const nextStep = Math.min(current.timeline.latestStep, current.timeline.cursorStep + 1)
+      if (nextStep === current.timeline.cursorStep) {
+        return current
+      }
+
+      return {
+        race: getRaceAtStep(current.timeline, nextStep),
+        timeline: {
+          ...current.timeline,
+          cursorStep: nextStep,
+        },
+      }
+    })
+  }, [])
+
+  const handleJumpToLatest = useCallback(() => {
+    setRunning(false)
+    setSession((current) => {
+      if (current.timeline.cursorStep === current.timeline.latestStep) {
+        return current
+      }
+
+      return {
+        race: getRaceAtStep(current.timeline, current.timeline.latestStep),
+        timeline: {
+          ...current.timeline,
+          cursorStep: current.timeline.latestStep,
+        },
+      }
+    })
   }, [])
 
   useEffect(() => {
@@ -256,7 +580,7 @@ function App() {
           const tickCount = Math.min(dueTicks, MAX_TICKS_PER_FRAME)
           lockstepAccumulatorRef.current =
             dueTicks > MAX_TICKS_PER_FRAME ? 0 : lockstepAccumulatorRef.current - dueTicks * interval
-          setRace((current) => runSteps(current, tickCount, tickCount))
+          handleAdvance(tickCount, tickCount)
         }
       } else {
         leftAccumulatorRef.current += delta
@@ -274,7 +598,7 @@ function App() {
           rightAccumulatorRef.current =
             rightDueTicks > MAX_TICKS_PER_FRAME ? 0 : rightAccumulatorRef.current - rightDueTicks * interval
 
-          setRace((current) => runSteps(current, leftTicks, rightTicks))
+          handleAdvance(leftTicks, rightTicks)
         }
       }
 
@@ -290,7 +614,9 @@ function App() {
       frameRef.current = null
       lastTimestampRef.current = null
     }
-  }, [isAnimating, lockstep, speed])
+  }, [handleAdvance, isAnimating, lockstep, speed])
+
+  const activeTimelineEntry = useMemo(() => getTimelineEntry(timeline, timeline.cursorStep), [timeline])
 
   return (
     <div className="min-h-screen bg-slate-950 px-4 py-6 text-slate-100">
@@ -344,6 +670,18 @@ function App() {
           />
           <Explanation leftDefinition={leftDefinition} rightDefinition={rightDefinition} lockstep={lockstep} />
         </section>
+
+        <Timeline
+          baseStep={timeline.baseStep}
+          latestStep={timeline.latestStep}
+          cursorStep={timeline.cursorStep}
+          historyCap={HISTORY_CAP}
+          entry={activeTimelineEntry}
+          onScrub={handleScrub}
+          onStepBack={handleTimelineBack}
+          onStepForward={handleTimelineForward}
+          onJumpToLatest={handleJumpToLatest}
+        />
 
         <footer className="text-xs text-slate-500">
           Seed: {race.seed} | Dataset size: {race.initialData.length}
