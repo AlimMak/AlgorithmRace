@@ -668,7 +668,16 @@ function App() {
             }}
             winnerLabel={winnerLabel}
           />
-          <Explanation leftDefinition={leftDefinition} rightDefinition={rightDefinition} lockstep={lockstep} />
+          <Explanation
+            leftDefinition={leftDefinition}
+            rightDefinition={rightDefinition}
+            lockstep={lockstep}
+            pattern={pattern}
+            leftEvents={activeTimelineEntry?.leftEvents ?? []}
+            rightEvents={activeTimelineEntry?.rightEvents ?? []}
+            leftDone={race.left.state.done}
+            rightDone={race.right.state.done}
+          />
         </section>
 
         <Timeline
