@@ -6,6 +6,7 @@ interface ControlsProps {
   speed: number
   pattern: DataPattern
   lockstep: boolean
+  soundEnabled: boolean
   running: boolean
   seedInput: string
   leftAlgorithm: AlgorithmKey
@@ -16,6 +17,7 @@ interface ControlsProps {
   onSpeedChange: (value: number) => void
   onPatternChange: (value: DataPattern) => void
   onLockstepChange: (value: boolean) => void
+  onSoundChange: (value: boolean) => void
   onSeedChange: (value: string) => void
   onLeftAlgorithmChange: (value: AlgorithmKey) => void
   onRightAlgorithmChange: (value: AlgorithmKey) => void
@@ -38,6 +40,7 @@ export const Controls = ({
   speed,
   pattern,
   lockstep,
+  soundEnabled,
   running,
   seedInput,
   leftAlgorithm,
@@ -48,6 +51,7 @@ export const Controls = ({
   onSpeedChange,
   onPatternChange,
   onLockstepChange,
+  onSoundChange,
   onSeedChange,
   onLeftAlgorithmChange,
   onRightAlgorithmChange,
@@ -64,23 +68,46 @@ export const Controls = ({
         <h1 className="text-2xl font-semibold tracking-tight text-slate-100">Algorithm Race Visualizer</h1>
         <p className="text-sm text-slate-400">Race two step-based sorting algorithms on the same seeded dataset.</p>
       </div>
-      <div className="flex items-center gap-3 rounded-lg border border-slate-800 bg-slate-900/70 px-3 py-2">
-        <label className="text-xs uppercase tracking-[0.12em] text-slate-400" htmlFor="lockstep-toggle">
-          Lockstep mode
-        </label>
-        <button
-          id="lockstep-toggle"
-          type="button"
-          onClick={() => onLockstepChange(!lockstep)}
-          className={`h-7 w-14 rounded-full border transition ${
-            lockstep ? 'border-sky-500 bg-sky-600/40' : 'border-slate-600 bg-slate-800'
-          }`}
-          aria-pressed={lockstep}
-        >
-          <span
-            className={`block h-5 w-5 rounded-full bg-slate-100 transition ${lockstep ? 'translate-x-7' : 'translate-x-1'}`}
-          />
-        </button>
+      <div className="grid gap-2 rounded-lg border border-slate-800 bg-slate-900/70 px-3 py-2">
+        <div className="flex items-center gap-3">
+          <label className="text-xs uppercase tracking-[0.12em] text-slate-400" htmlFor="lockstep-toggle">
+            Lockstep mode
+          </label>
+          <button
+            id="lockstep-toggle"
+            type="button"
+            onClick={() => onLockstepChange(!lockstep)}
+            className={`h-7 w-14 rounded-full border transition ${
+              lockstep ? 'border-sky-500 bg-sky-600/40' : 'border-slate-600 bg-slate-800'
+            }`}
+            aria-pressed={lockstep}
+          >
+            <span
+              className={`block h-5 w-5 rounded-full bg-slate-100 transition ${lockstep ? 'translate-x-7' : 'translate-x-1'}`}
+            />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <label className="text-xs uppercase tracking-[0.12em] text-slate-400" htmlFor="sound-toggle">
+            Sound cues
+          </label>
+          <button
+            id="sound-toggle"
+            type="button"
+            onClick={() => onSoundChange(!soundEnabled)}
+            className={`h-7 w-14 rounded-full border transition ${
+              soundEnabled ? 'border-teal-500 bg-teal-600/40' : 'border-slate-600 bg-slate-800'
+            }`}
+            aria-pressed={soundEnabled}
+          >
+            <span
+              className={`block h-5 w-5 rounded-full bg-slate-100 transition ${
+                soundEnabled ? 'translate-x-7' : 'translate-x-1'
+              }`}
+            />
+          </button>
+        </div>
       </div>
     </div>
 

@@ -16,6 +16,10 @@ const DEFAULT_RIGHT: AlgorithmKey = 'merge'
 const MAX_TICKS_PER_FRAME = 24
 const HISTORY_CAP = 1800
 const SNAPSHOT_INTERVAL = 20
+const COMPARE_CUE_INTERVAL_MS = 75
+const SWAP_CUE_INTERVAL_MS = 120
+const COMPARE_CUE_FREQUENCY = 620
+const SWAP_CUE_FREQUENCY = 390
 
 interface RunnerState {
   algorithm: AlgorithmKey
@@ -60,6 +64,13 @@ interface RunnerStepOutcome {
   runner: RunnerState
   didStep: boolean
   events: StepEvent[]
+}
+
+interface AudioCueState {
+  context: AudioContext | null
+  masterGain: GainNode | null
+  lastCompareAtMs: number
+  lastSwapAtMs: number
 }
 
 const createRunner = (algorithm: AlgorithmKey, data: number[]): RunnerState => ({
@@ -348,6 +359,7 @@ function App() {
   const [rightAlgorithm, setRightAlgorithm] = useState<AlgorithmKey>(DEFAULT_RIGHT)
   const [seedInput, setSeedInput] = useState(String(initialSeed))
   const [running, setRunning] = useState(false)
+  const [soundEnabled, setSoundEnabled] = useState(false)
   const [session, setSession] = useState<SessionState>(() => {
     const data = generateDataset({ size: DEFAULT_SIZE, pattern: DEFAULT_PATTERN, seed: initialSeed })
     return createSession(createRace(data, initialSeed, DEFAULT_LEFT, DEFAULT_RIGHT))
@@ -358,6 +370,13 @@ function App() {
   const lockstepAccumulatorRef = useRef(0)
   const leftAccumulatorRef = useRef(0)
   const rightAccumulatorRef = useRef(0)
+  const audioRef = useRef<AudioCueState>({
+    context: null,
+    masterGain: null,
+    lastCompareAtMs: 0,
+    lastSwapAtMs: 0,
+  })
+  const lastSonifiedStepRef = useRef(0)
 
   const race = session.race
   const timeline = session.timeline
@@ -547,6 +566,87 @@ function App() {
     })
   }, [])
 
+  const ensureAudioContext = useCallback((): boolean => {
+    if (typeof window === 'undefined') {
+      return false
+    }
+
+    const audioState = audioRef.current
+    if (!audioState.context) {
+      const webkitWindow = window as Window & { webkitAudioContext?: typeof AudioContext }
+      const ContextCtor = window.AudioContext ?? webkitWindow.webkitAudioContext
+
+      if (!ContextCtor) {
+        return false
+      }
+
+      const context = new ContextCtor()
+      const masterGain = context.createGain()
+      masterGain.gain.value = 0.018
+      masterGain.connect(context.destination)
+
+      audioState.context = context
+      audioState.masterGain = masterGain
+    }
+
+    if (audioState.context.state === 'suspended') {
+      void audioState.context.resume()
+    }
+
+    return true
+  }, [])
+
+  const playCue = useCallback((cueType: 'compare' | 'swap') => {
+    const audioState = audioRef.current
+    if (!audioState.context || !audioState.masterGain) {
+      return
+    }
+
+    const nowMs = performance.now()
+    const isCompare = cueType === 'compare'
+    const lastPlayedAt = isCompare ? audioState.lastCompareAtMs : audioState.lastSwapAtMs
+    const minInterval = isCompare ? COMPARE_CUE_INTERVAL_MS : SWAP_CUE_INTERVAL_MS
+
+    if (nowMs - lastPlayedAt < minInterval) {
+      return
+    }
+
+    if (isCompare) {
+      audioState.lastCompareAtMs = nowMs
+    } else {
+      audioState.lastSwapAtMs = nowMs
+    }
+
+    const context = audioState.context
+    const oscillator = context.createOscillator()
+    const gain = context.createGain()
+    const startAt = context.currentTime + 0.004
+    const duration = isCompare ? 0.05 : 0.07
+    const peak = isCompare ? 0.011 : 0.016
+
+    oscillator.type = isCompare ? 'sine' : 'triangle'
+    oscillator.frequency.setValueAtTime(isCompare ? COMPARE_CUE_FREQUENCY : SWAP_CUE_FREQUENCY, startAt)
+
+    gain.gain.setValueAtTime(0.0001, startAt)
+    gain.gain.exponentialRampToValueAtTime(peak, startAt + 0.006)
+    gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration)
+
+    oscillator.connect(gain)
+    gain.connect(audioState.masterGain)
+    oscillator.start(startAt)
+    oscillator.stop(startAt + duration)
+  }, [])
+
+  const handleSoundChange = useCallback(
+    (enabled: boolean) => {
+      setSoundEnabled(enabled)
+      if (enabled) {
+        ensureAudioContext()
+      }
+    },
+    [ensureAudioContext],
+  )
+
   useEffect(() => {
     if (!isAnimating) {
       if (frameRef.current !== null) {
@@ -616,6 +716,66 @@ function App() {
     }
   }, [handleAdvance, isAnimating, lockstep, speed])
 
+  useEffect(() => {
+    if (!soundEnabled) {
+      lastSonifiedStepRef.current = timeline.latestStep
+      return
+    }
+
+    if (!ensureAudioContext()) {
+      return
+    }
+
+    if (timeline.latestStep < lastSonifiedStepRef.current) {
+      lastSonifiedStepRef.current = Math.max(timeline.baseStep, timeline.latestStep - 1)
+    }
+
+    const startStep = Math.max(timeline.baseStep + 1, lastSonifiedStepRef.current + 1)
+    if (startStep > timeline.latestStep) {
+      return
+    }
+
+    let heardCompare = false
+    let heardSwap = false
+
+    for (let step = startStep; step <= timeline.latestStep; step += 1) {
+      const entry = getTimelineEntry(timeline, step)
+      if (!entry) {
+        continue
+      }
+
+      const laneEvents = [...entry.leftEvents, ...entry.rightEvents]
+      if (!heardSwap) {
+        heardSwap = laneEvents.some((event) => event.type === 'swap')
+      }
+      if (!heardCompare) {
+        heardCompare = laneEvents.some((event) => event.type === 'compare')
+      }
+
+      if (heardSwap && heardCompare) {
+        break
+      }
+    }
+
+    if (heardSwap) {
+      playCue('swap')
+    } else if (heardCompare) {
+      playCue('compare')
+    }
+
+    lastSonifiedStepRef.current = timeline.latestStep
+  }, [ensureAudioContext, playCue, soundEnabled, timeline])
+
+  useEffect(() => {
+    const audioState = audioRef.current
+    return () => {
+      const context = audioState.context
+      if (context && context.state !== 'closed') {
+        void context.close()
+      }
+    }
+  }, [])
+
   const activeTimelineEntry = useMemo(() => getTimelineEntry(timeline, timeline.cursorStep), [timeline])
 
   return (
@@ -626,6 +786,7 @@ function App() {
           speed={speed}
           pattern={pattern}
           lockstep={lockstep}
+          soundEnabled={soundEnabled}
           running={isAnimating}
           seedInput={seedInput}
           leftAlgorithm={leftAlgorithm}
@@ -636,6 +797,7 @@ function App() {
           onSpeedChange={setSpeed}
           onPatternChange={setPattern}
           onLockstepChange={setLockstep}
+          onSoundChange={handleSoundChange}
           onSeedChange={setSeedInput}
           onLeftAlgorithmChange={handleLeftAlgorithm}
           onRightAlgorithmChange={handleRightAlgorithm}
